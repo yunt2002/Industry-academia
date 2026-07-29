@@ -1,1 +1,1 @@
-# -Industry-academia
+# Industry-academia
