@@ -1,0 +1,12 @@
+{
+  "mqtt": {
+    "broker_address": "broker.hivemq.com",
+    "broker_port": 1883,
+    "topic": "sensor/stress_data",
+    "qos": 1,
+    "keepalive": 60,
+    "reconnect_interval": 5000
+  },
+  "use_dummy_data": true,
+  "dummy_data_interval": 2000
+}
