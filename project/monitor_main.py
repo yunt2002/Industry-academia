@@ -15,6 +15,8 @@ from PyQt6.QtGui import QImage, QPixmap
 import pyqtgraph as pg
 import paho.mqtt.client as mqtt
 
+from monitor_server import MonitoringServerState, start_monitoring_server, stop_monitoring_server
+
 
 class StressMonitorApp(QMainWindow):
     data_received_signal = pyqtSignal(float, float, float)
@@ -23,6 +25,7 @@ class StressMonitorApp(QMainWindow):
         super().__init__()
         self.config = self.load_config()
         self.mqtt_settings = self.config.get('mqtt', {})
+        self.server_settings = self.config.get('server', {})
         self.use_dummy_data = self.config.get('use_dummy_data', False)
         self.dummy_data_interval = self.config.get('dummy_data_interval', 2000)
         self.algorithm_fields = {
@@ -31,6 +34,9 @@ class StressMonitorApp(QMainWindow):
             'trend_score': None
         }
         self.test_timer = None
+        self.server_state = MonitoringServerState()
+        self.server = None
+        self.server_thread = None
         # 기본 언어 설정 및 번역 사전
         self.lang = 'en'
         self.translations = {
@@ -135,10 +141,13 @@ class StressMonitorApp(QMainWindow):
         # 1. DB 초기화
         self.init_db()
 
-        # 2. 메인 UI 레이아웃 초기화
+        # 2. 웹 서버 시작
+        self.start_server()
+
+        # 3. 메인 UI 레이아웃 초기화
         self.init_ui()
 
-        # 3. 노트북 내장 웹캠 초기화 및 타이머 설정
+        # 4. 노트북 내장 웹캠 초기화 및 타이머 설정
         self.init_camera()
 
         # 실시간 그래프 출력을 위한 데이터 버퍼
@@ -164,6 +173,20 @@ class StressMonitorApp(QMainWindow):
             except Exception as exc:
                 print(f"설정 파일 로드 오류: {exc}")
         return {}
+
+    def start_server(self):
+        """최신 센서 데이터를 외부에서 조회할 수 있도록 HTTP 서버를 시작"""
+        if not self.server_settings.get('enabled', True):
+            return
+        try:
+            host = self.server_settings.get('host', '0.0.0.0')
+            port = int(self.server_settings.get('port', 8765))
+            self.server, self.server_thread = start_monitoring_server(self.server_state, host=host, port=port)
+            print(f"모니터링 서버 시작: http://{host}:{port}")
+        except Exception as exc:
+            print(f"모니터링 서버 시작 오류: {exc}")
+            self.server = None
+            self.server_thread = None
 
     def init_db(self):
         """SQLite 데이터베이스 연동 및 테이블 생성/마이그레이션"""
@@ -253,6 +276,14 @@ class StressMonitorApp(QMainWindow):
         """MQTT로 받은 데이터를 DB에 저장하고 화면을 업데이트"""
         self.save_to_db(hr, spo2, stress)
         self.update_ui(hr, spo2, stress)
+        self.server_state.update({
+            "heart_rate": hr,
+            "spo2": spo2,
+            "stress": stress,
+            "stress_level": self.algorithm_fields.get('stress_level'),
+            "alert": self.algorithm_fields.get('alert'),
+            "trend_score": self.algorithm_fields.get('trend_score'),
+        })
 
     def init_ui(self):
         """PyQt6 기반 메인 모니터링 UI 구성"""
@@ -719,6 +750,14 @@ class StressMonitorApp(QMainWindow):
 
         self.save_to_db(fake_hr, fake_spo2, fake_stress)
         self.update_ui(fake_hr, fake_spo2, fake_stress)
+        self.server_state.update({
+            "heart_rate": fake_hr,
+            "spo2": fake_spo2,
+            "stress": fake_stress,
+            "stress_level": self.algorithm_fields.get('stress_level'),
+            "alert": self.algorithm_fields.get('alert'),
+            "trend_score": self.algorithm_fields.get('trend_score'),
+        })
 
     def closeEvent(self, event):
         """프로그램 종료 시 웹캠 및 DB 리소스 안전 반환"""
@@ -736,6 +775,10 @@ class StressMonitorApp(QMainWindow):
         if hasattr(self, 'mqtt_client'):
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
+        try:
+            stop_monitoring_server(self.server)
+        except Exception:
+            pass
         try:
             self.conn.close()
         except Exception:

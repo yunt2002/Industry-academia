@@ -7,6 +7,11 @@
     "keepalive": 60,
     "reconnect_interval": 5000
   },
-  "use_dummy_data": true,
-  "dummy_data_interval": 2000
+  "use_dummy_data": false,
+  "dummy_data_interval": 2000,
+  "server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8765
+  }
 }
