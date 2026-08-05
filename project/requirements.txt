@@ -1,3 +1,8 @@
 paho-mqtt>=1.6
 pyqt6>=6.0
 pyqtgraph>=0.12
+opencv-python>=4.5
+numpy>=1.20
+mediapipe>=0.10
+scipy>=1.7  # Optional: for better Butterworth filtering in micro_movement_features
+pytest>=6.0  # For running unit tests

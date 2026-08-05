@@ -4,6 +4,7 @@ import sys
 import sqlite3
 import random
 import cv2
+from collections import deque
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
@@ -14,8 +15,10 @@ from PyQt6.QtCore import QTimer, Qt, QDateTime, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 import pyqtgraph as pg
 import paho.mqtt.client as mqtt
+import numpy as np
 
 from monitor_server import MonitoringServerState, start_monitoring_server, stop_monitoring_server
+from processing.facial_features import FacialFeatureExtractor
 
 
 class StressMonitorApp(QMainWindow):
@@ -150,6 +153,9 @@ class StressMonitorApp(QMainWindow):
         # 4. 노트북 내장 웹캠 초기화 및 타이머 설정
         self.init_camera()
 
+        # 5. 얼굴 특징 추출기 초기화 (설정에서 활성화된 경우)
+        self.init_facial_features()
+
         # 실시간 그래프 출력을 위한 데이터 버퍼
         self.time_data = list(range(60))
         self.hr_data = [0] * 60
@@ -217,6 +223,36 @@ class StressMonitorApp(QMainWindow):
             except Exception as exc:
                 print(f"DB 컬럼 추가 오류 ({column_name}): {exc}")
 
+    def init_facial_features(self):
+        """얼굴 특징 추출기 초기화 (설정에서 활성화된 경우)"""
+        self.ff_extractor = None
+        self.frame_buffer = None
+        self.fs_video = None
+        self.window_frame_count = None
+        self.window_counter = 0
+        
+        face_config = self.config.get('face_integration', {})
+        if not face_config.get('enabled', False):
+            print("얼굴 특징 추출이 비활성화되어 있습니다.")
+            return
+        
+        try:
+            model_path = face_config.get('face_model_path', 'model/face_landmarker.task')
+            self.fs_video = float(face_config.get('fs_video', 30.0))
+            window_seconds = int(face_config.get('window_seconds', 30))
+            self.window_frame_count = int(self.fs_video * window_seconds)
+            
+            # FacialFeatureExtractor 생성 (실패 시 예외)
+            self.ff_extractor = FacialFeatureExtractor(model_path=model_path)
+            # 프레임 버퍼 (고정 크기 deque)
+            self.frame_buffer = deque(maxlen=self.window_frame_count)
+            
+            print(f"얼굴 특징 추출기 초기화 완료: {model_path} (window={window_seconds}s)")
+        except RuntimeError as e:
+            print(f"얼굴 특징 추출기 초기화 실패: {e}")
+            self.ff_extractor = None
+            self.frame_buffer = None
+
     def init_mqtt(self):
         """MQTT 브로커 연결 및 구독 설정"""
         self.mqtt_client = mqtt.Client()
@@ -274,12 +310,23 @@ class StressMonitorApp(QMainWindow):
 
     def handle_new_data(self, hr, spo2, stress):
         """MQTT로 받은 데이터를 DB에 저장하고 화면을 업데이트"""
-        self.save_to_db(hr, spo2, stress)
-        self.update_ui(hr, spo2, stress)
+        # ============================================================
+        # [수정] 계산된 스트레스가 있으면 대시보드에 표시
+        # ============================================================
+        display_stress = stress  # 기본값: MQTT 스트레스
+        
+        # 계산된 스트레스가 있으면 그것을 사용 (0-10 범위 → 0-100 범위로 변환)
+        calculated_stress = self.algorithm_fields.get('calculated_stress')
+        if calculated_stress is not None:
+            display_stress = calculated_stress * 10  # 0-10 → 0-100
+        
+        self.save_to_db(hr, spo2, display_stress)
+        self.update_ui(hr, spo2, display_stress)
         self.server_state.update({
             "heart_rate": hr,
             "spo2": spo2,
-            "stress": stress,
+            "stress": display_stress,
+            "calculated_stress": calculated_stress,
             "stress_level": self.algorithm_fields.get('stress_level'),
             "alert": self.algorithm_fields.get('alert'),
             "trend_score": self.algorithm_fields.get('trend_score'),
@@ -554,6 +601,116 @@ class StressMonitorApp(QMainWindow):
 
         if ret:
             try:
+                # ============================================================
+                # [추가] 얼굴 특징 추출: 프레임을 버퍼에 적재
+                # ============================================================
+                if self.ff_extractor is not None and self.frame_buffer is not None:
+                    try:
+                        # BGR 프레임을 버퍼에 보관 (최대 window_frame_count개)
+                        self.frame_buffer.append(frame.copy())
+                        self.window_counter += 1
+                        
+                        # 윈도우가 가득 찼으면 요약 실행
+                        if self.window_counter >= self.window_frame_count and len(self.frame_buffer) == self.frame_buffer.maxlen:
+                            self._process_facial_window()
+                            self.window_counter = 0
+                    except Exception as e:
+                        print(f"얼굴 프레임 처리 오류: {e}")
+                
+                # ============================================================
+                # [신규] 얼굴 landmark 시각화: 박스와 특징점 그리기
+                # ============================================================
+                if self.ff_extractor is not None:
+                    try:
+                        viz_result = self.ff_extractor.detect_landmarks_for_viz(frame)
+                        if viz_result is not None:
+                            lm, bbox = viz_result
+                            h, w = frame.shape[:2]
+                            
+                            # 1. 얼굴 감지 박스 (녹색)
+                            x1 = int(bbox[0] * w)
+                            y1 = int(bbox[1] * h)
+                            x2 = int(bbox[2] * w)
+                            y2 = int(bbox[3] * h)
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            
+                            # 2. 주요 특징점 그리기 (작은 원)
+                            # 눈 (연파랑)
+                            for idx in [33, 133, 160, 158, 362, 263, 385, 387]:
+                                if idx < len(lm):
+                                    pt = lm[idx]
+                                    cx, cy = int(pt.x * w), int(pt.y * h)
+                                    if 0 <= cx < w and 0 <= cy < h:
+                                        cv2.circle(frame, (cx, cy), 3, (255, 128, 0), -1)
+                            
+                            # 코 (흰색)
+                            for idx in [1, 4, 5]:
+                                if idx < len(lm):
+                                    pt = lm[idx]
+                                    cx, cy = int(pt.x * w), int(pt.y * h)
+                                    if 0 <= cx < w and 0 <= cy < h:
+                                        cv2.circle(frame, (cx, cy), 3, (255, 255, 255), -1)
+                            
+                            # 입 (주황색)
+                            for idx in [61, 291, 13, 14]:
+                                if idx < len(lm):
+                                    pt = lm[idx]
+                                    cx, cy = int(pt.x * w), int(pt.y * h)
+                                    if 0 <= cx < w and 0 <= cy < h:
+                                        cv2.circle(frame, (cx, cy), 3, (0, 165, 255), -1)
+                            
+                            # 3. 텍스트 표시 (박스 오른쪽 상단에 자연스럽게)
+                            stress_val = self.algorithm_fields.get('stress_level', 'N/A')
+                            alert_status = self.algorithm_fields.get('alert', 'sensor_unstable')
+                            
+                            # 감정 텍스트
+                            emotion_text = "NEUTRAL"
+                            color = (0, 255, 0)  # 녹색
+                            if alert_status == 'high_stress':
+                                emotion_text = "STRESSED"
+                                color = (0, 0, 255)  # 빨강
+                            elif alert_status == 'watch':
+                                emotion_text = "ALERT"
+                                color = (0, 255, 255)  # 노랑
+                            
+                            # 텍스트를 박스 오른쪽에 배치 (더 자연스럽게)
+                            text_x = x2 + 15  # 박스 오른쪽으로 15px
+                            text_y = y1 + 25
+                            
+                            # 감정 텍스트 (반투명 배경 포함)
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 0.6
+                            thickness = 1
+                            
+                            # 텍스트 크기 측정
+                            (text_w, text_h), baseline = cv2.getTextSize(emotion_text, font, font_scale, thickness)
+                            
+                            # 반투명 배경 (어두운 박스)
+                            bg_color = (30, 30, 30)
+                            cv2.rectangle(frame, (text_x - 5, text_y - text_h - 5),
+                                        (text_x + text_w + 5, text_y + baseline + 5),
+                                        bg_color, -1)
+                            
+                            # 텍스트 그리기
+                            cv2.putText(frame, emotion_text, (text_x, text_y),
+                                       font, font_scale, color, thickness)
+                            
+                            # 스트레스 점수 (감정 아래)
+                            if stress_val is not None:
+                                score_text = f"Stress: {stress_val}"
+                                score_y = text_y + 20
+                                
+                                (score_w, score_h), baseline = cv2.getTextSize(score_text, font, 0.5, 1)
+                                cv2.rectangle(frame, (text_x - 5, score_y - score_h - 5),
+                                            (text_x + score_w + 5, score_y + baseline + 5),
+                                            bg_color, -1)
+                                
+                                cv2.putText(frame, score_text, (text_x, score_y),
+                                           font, 0.5, color, 1)
+                    except Exception as e:
+                        print(f"얼굴 시각화 오류: {type(e).__name__}: {str(e)[:100]}")
+                # ============================================================
+                
                 rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
@@ -577,6 +734,107 @@ class StressMonitorApp(QMainWindow):
                 self.cam_timer.stop()
             except Exception:
                 pass
+
+    def _process_facial_window(self):
+        """
+        윈도우에 쌓인 프레임들(30초 분량)을 처리해 얼굴 특징 요약을 계산.
+        결과를 알고리즘 필드에 반영하고, 스트레스 레벨을 동적으로 계산합니다.
+        """
+        try:
+            frames_for_window = list(self.frame_buffer)
+            if len(frames_for_window) < 2:
+                return
+            
+            summary = self.ff_extractor.process_window(frames_for_window, fs_video=self.fs_video)
+            
+            # 요약 결과를 알고리즘 필드에 반영
+            self.algorithm_fields['blink_rate_per_min'] = summary.get('blink_rate_per_min')
+            self.algorithm_fields['lip_tremor'] = summary.get('lip_tremor')
+            self.algorithm_fields['pupil_jitter'] = summary.get('pupil_jitter')
+            self.algorithm_fields['avg_ear'] = summary.get('avg_ear')
+            self.algorithm_fields['brow_tension'] = summary.get('brow_tension')
+            
+            # ============================================================
+            # [신규] 얼굴 분석 데이터로부터 동적 스트레스 계산
+            # ============================================================
+            stress_score = self._calculate_stress_from_facial_features(summary)
+            self.algorithm_fields['calculated_stress'] = stress_score
+            
+            # MQTT가 제공하지 않으면 계산된 값 사용, 제공하면 혼합
+            mqtt_stress = self.algorithm_fields.get('stress_level')
+            if mqtt_stress is None or mqtt_stress == 'low':
+                # MQTT 데이터가 없거나 기본값이면 계산된 스트레스 사용
+                if stress_score < 2:
+                    self.algorithm_fields['stress_level'] = 'low'
+                    self.algorithm_fields['alert'] = 'normal'
+                elif stress_score < 4:
+                    self.algorithm_fields['stress_level'] = 'moderate'
+                    self.algorithm_fields['alert'] = 'watch'
+                else:
+                    self.algorithm_fields['stress_level'] = 'high'
+                    self.algorithm_fields['alert'] = 'high_stress'
+            # ============================================================
+            
+            print(f"얼굴 특징 요약: blink_rate={summary.get('blink_rate_per_min')}, "
+                  f"lip_tremor={summary.get('lip_tremor')}, "
+                  f"pupil_jitter={summary.get('pupil_jitter')}, "
+                  f"detection_rate={summary.get('face_detection_rate')}, "
+                  f"calculated_stress={stress_score:.2f}")
+            
+            # 서버 상태 업데이트 (외부 조회 가능)
+            self.server_state.update({
+                "blink_rate_per_min": summary.get('blink_rate_per_min'),
+                "lip_tremor": summary.get('lip_tremor'),
+                "pupil_jitter": summary.get('pupil_jitter'),
+                "avg_ear": summary.get('avg_ear'),
+                "brow_tension": summary.get('brow_tension'),
+                "face_detection_rate": summary.get('face_detection_rate'),
+                "calculated_stress": stress_score,
+                "stress_level": self.algorithm_fields.get('stress_level'),
+                "alert": self.algorithm_fields.get('alert'),
+            })
+        except Exception as e:
+            print(f"얼굴 윈도우 처리 오류: {e}")
+
+    def _calculate_stress_from_facial_features(self, summary: dict) -> float:
+        """
+        얼굴 특징 데이터로부터 0~10 범위의 스트레스 점수를 계산합니다.
+        - 깜박임 빈도: 너무 많으면 스트레스/피로
+        - 입 떨림: 높을수록 불안정
+        - 동공 흔들림: 높을수록 불안정
+        - 눈썹 긴장: 높을수록 스트레스
+        """
+        score = 0.0
+        
+        # 1. 깜박임 비율 (정상: 15-20회/분, 스트레스 시 증가 또는 감소)
+        blink_rate = summary.get('blink_rate_per_min', 0)
+        if blink_rate > 25:  # 과도한 깜박임
+            score += min(2.0, (blink_rate - 25) / 10)
+        elif blink_rate < 5:  # 깜박임 부족 (집중, 스트레스)
+            score += min(2.0, (5 - blink_rate) / 5)
+        
+        # 2. 입 떨림 (높을수록 불안정)
+        lip_tremor = summary.get('lip_tremor', 0)
+        if lip_tremor > 0.01:
+            score += min(3.0, (lip_tremor - 0.01) * 100)
+        
+        # 3. 동공 흔들림 (높을수록 불안정)
+        pupil_jitter = summary.get('pupil_jitter', 0)
+        if pupil_jitter > 0.01:
+            score += min(3.0, (pupil_jitter - 0.01) * 100)
+        
+        # 4. 눈썹 긴장 (높을수록 스트레스)
+        brow_tension = summary.get('brow_tension', 0)
+        if brow_tension > 5:  # 정상 눈썹-눈 거리
+            score += min(2.0, (brow_tension - 5) / 10)
+        
+        # 얼굴 감지율이 낮으면 신뢰도 감소
+        detection_rate = summary.get('face_detection_rate', 1.0)
+        if detection_rate < 0.8:
+            score *= detection_rate
+        
+        # 0~10 범위로 정규화
+        return max(0.0, min(10.0, score))
 
     def save_to_db(self, hr, spo2, stress):
         """수신된 데이터를 로컬 DB에 INSERT"""
@@ -772,6 +1030,12 @@ class StressMonitorApp(QMainWindow):
             self.test_timer.stop()
         except Exception:
             pass
+        # 얼굴 추출기 리소스 정리
+        if self.ff_extractor is not None:
+            try:
+                self.ff_extractor.close()
+            except Exception as e:
+                print(f"얼굴 추출기 종료 오류: {e}")
         if hasattr(self, 'mqtt_client'):
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()

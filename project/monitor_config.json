@@ -13,5 +13,14 @@
     "enabled": true,
     "host": "0.0.0.0",
     "port": 8765
+  },
+  "face_integration": {
+    "enabled": true,
+    "face_model_path": "model/face_landmarker.task",
+    "window_seconds": 30,
+    "fs_video": 30.0,
+    "publish_algorithm_mqtt": false,
+    "algorithm_mqtt_topic": "sensor/algorithm_features",
+    "algorithm_mqtt_qos": 1
   }
 }
